@@ -7,6 +7,8 @@ import (
 	"reflect"
 )
 
+const verbose = false
+
 // lambda calculus
 // expressions verified with
 // https://crypto.stanford.edu/~blynn/lambda/
@@ -24,14 +26,12 @@ type Expression interface {
 // Computation is reducing the expression until you
 // can't any longer.
 //
-// Specifically alpha and beta reduction.
-// beta reduction is performing a recursive reduction
-// on Apply{Bind, ?...}.
-//
-// Alpha reduction is renaming bound variables
-// so that running apply won't cause collisions.
-// We get around it by applying a Scope{} struct
-// to variable substitutions to, which feels cleaner.
+// We found a technique to avoid the ugliness of
+// alpha conversion or de bruijn numbering,
+// by putting angle brackets around a
+// substituted variable whenever
+// in Apply{Bind{VAR, LHS}, RHS}
+// Bound(LHS) intersect Free(RHS) is nonempty.
 
 type Var struct {
 	V string
@@ -60,20 +60,75 @@ type scope struct {
 
 func (v Var) Reduce() Expression { return v }
 
-func (b Bind) Reduce() Expression { return b }
+// if you're a lambda at head, keep recursively
+// going until you can find an apply,
+// or you end the traversal
+func (b Bind) Reduce() Expression {
+	return Bind{b.V, b.E.Reduce()}
+}
 
+// if Bound(lhs) intersects Free(rhs)
+// that's a collision that requires renaming
+// (or scope struct on right side?)
 func (s scope) Reduce() Expression { return s }
+
+// bound returns the first string
+// of lambda terms on LHS
+func bound(e Expression) []Var {
+	var ret []Var
+	var f func(Expression)
+	f = func(exp Expression) {
+		switch v := exp.(type) {
+		case Bind:
+			ret = append(ret, v.V)
+			f(v.E)
+		case Var:
+			// pass
+		case scope:
+			f(v.E)
+		case Apply:
+			f(v.A1)
+			f(v.A2)
+		}
+	}
+	f(e)
+	return ret
+}
+
+func scopeCollissions(e Expression, b []Var) Expression {
+	myBound := bound(e)
+	var f func(Expression) Expression
+	f = func(exp Expression) Expression {
+		// If you're a var and you collide, scope
+		// otherwise recurse.
+		switch v := exp.(type) {
+		case Var:
+			for _, collision := range b {
+				for _, term := range myBound {
+					if reflect.DeepEqual(collision, term) {
+						return v
+					}
+				}
+				if reflect.DeepEqual(collision, v) {
+					return scope{v}
+				}
+			}
+			return v
+		case Apply:
+			return Apply{f(v.A1), f(v.A2)}
+		case Bind:
+			return Bind{v.V, f(v.E)}
+		case scope:
+			return v
+		}
+		panic("shouldn't get here")
+	}
+	return f(e)
+}
 
 func (a Apply) Reduce() Expression {
 	// the highest precedence goes to
 	// apply{bind, ?}
-
-	// Apply{scope{lambda}, x} ->
-	// Apply{lambda, x}
-	if v, ok := a.A1.(scope); ok {
-		//fmt.Printf("Got here %v\n", String(Apply{v.E, a.A2}) )
-		return Apply{v.E, a.A2}
-	}
 
 	// after trying that,
 	// if either child is apply, try to recursively
@@ -99,28 +154,13 @@ func (a Apply) Reduce() Expression {
 	// Tokenize rhs. Break up nodes through first
 	// run of applies.
 
-	var head, tail Expression
-	// so we break the x? into the three cases
-	switch v := rhs.(type) {
-	case Var, Bind, scope:
-		head = v
-	case Apply:
-		head = v.A1
-		tail = v.A2
-	}
-
-	if head == nil {
-		panic("unexpected")
-	}
 	// Peel off the leftmost lambda
 	substitute := lhs.V
-	// substitute the var throughout with
-	// the innermost token, but don't go through
-	// other lambdas so you don't need to
-	// do alpha reduction
+	// Put scope{} sigils around
+	// free variables on RHS that are
+	// bound on LHS
+	rhs = scopeCollissions(rhs, bound(lhs.E))
 
-	// this logic is wrong, try a capture block
-	// on substitution
 	var sub func(Expression) Expression
 	sub = func(e Expression) Expression {
 		switch v := e.(type) {
@@ -128,41 +168,18 @@ func (a Apply) Reduce() Expression {
 			return Apply{sub(v.A1), sub(v.A2)}
 		case Var:
 			if reflect.DeepEqual(v, substitute) {
-				// where scope would go
-				if _, ok := head.(scope); ok {
-					return head
-				}
-				return scope{head}
+				return rhs
 			}
 			return v
 		case Bind:
-			/*
-			   if avoidCapture{
-			     return v
-			   }*/
-			// we're still in the original lambda
+			if reflect.DeepEqual(v.V, substitute) {
+				return v
+			}
 			return Bind{v.V, sub(v.E)}
 		}
 		return e
 	}
-
-	// ret := sub(lhs.E)
-	// Do we have more lambdas to pick through?
-	_, ok := lhs.E.(Bind)
-
-	// fmt.Printf("H|%v\nT|%v\n", head, tail)
-	// reduced := sub(lhs.E)
-
-	if tail != nil && ok {
-		return Apply{sub(lhs.E), tail}
-	}
-
 	return sub(lhs.E)
-
-	// fmt.Printf("A %v \nB %v\n", String(lhs),
-	// String(rhs))
-	// fmt.Printf("Tokens %v\n", tokens)
-	return a
 }
 
 func String(e Expression) string {
@@ -175,120 +192,160 @@ func String(e Expression) string {
 		return fmt.Sprintf("(λ%v.%v)",
 			String(v.V), String(v.E))
 	case Apply:
-		return fmt.Sprintf("[%v|%v]",
+		return fmt.Sprintf("(%v %v)",
 			String(v.A1), String(v.A2))
 	}
 	return ""
 }
 
-/*
-TRUE := λx.λy.x
-FALSE := λx.λy.y
-
-AND := λp.λq.p q p
-OR := λp.λq.p p q
-*/
 func Compute(e Expression) Expression {
-
-	halt := func(exp Expression) bool {
-		// keep going as long as root node is apply
-		v, ok := exp.(Apply)
-		if !ok {
-			return true
-		}
-		// and
-		// left child is lambda or Apply or scope OR
-		if _, ok := v.A1.(Bind); ok {
-			return false
-		}
-		if _, ok := v.A1.(Apply); ok {
-			return false
-		}
-
-		if _, ok := v.A1.(scope); ok {
-			return false
-		}
-
-		// right child is Apply
-		if _, ok := v.A2.(Apply); ok {
-			return false
-		}
-		return true
+	// keep going until no reduction was made
+	last := e
+	if verbose {
+		fmt.Printf("\nStarting: %v\n", String(e))
 	}
-
-	fmt.Printf("\nStarting: %v\n", String(e))
 	for i := 0; i < 20; i++ {
-		if halt(e) {
+		e = e.Reduce()
+		if verbose {
+			fmt.Printf("Step %v\n", String(e))
+		}
+		if reflect.DeepEqual(last, e) {
 			return e
 		}
-		e = e.Reduce()
+		last = e
 
-		fmt.Printf("Step %v\n", String(e))
 	}
-	fmt.Println("Computation timeout at 20")
+	if verbose {
+		fmt.Println("Computation timeout at 20")
+	}
+	// remove top level scopes as redundant
+	if v, ok := e.(scope); ok {
+		return v.E
+	}
 	return e
 }
 
-// λf.λx.f (f x) = 2
+/*
+ *  HELPER FUNCTIONS for prettier expressions
+ */
+func l(v Var, e ...Expression) Bind {
+	if len(e) == 0 {
+		panic("trying to make lambda expression with no body")
+	}
+	if len(e) == 1 {
+		return Bind{v, e[0]}
+	}
+	arg := Apply{e[0], e[1]}
+	for i := 2; i < len(e); i++ {
+		arg = Apply{arg, e[i]}
+	}
+
+	return Bind{v, arg}
+}
+
+// apply
+func a(e ...Expression) Apply {
+	if len(e) < 2 {
+		panic("trying to apply less than two args")
+	}
+	arg := Apply{e[0], e[1]}
+	for i := 2; i < len(e); i++ {
+		arg = Apply{arg, e[i]}
+	}
+	return arg
+}
+
+// scope wrap an expression
+func s(e Expression) scope {
+	return scope{e}
+}
 
 func main() {
-	x, y := Var{"x"}, Var{"y"}
+	if test() {
+		fmt.Printf("Tests passed successfully")
+	}
+}
+
+// To be refactored to test file
+func test() bool {
+	// TODO: replace all tests with de bruijn indices
+
+	x, y, f := Var{"x"}, Var{"y"}, Var{"f"}
 	p, q := Var{"p"}, Var{"q"}
-	_, b, _ := Var{"a"}, Var{"b"}, Var{"c"}
+	A, B, C := Var{"a"}, Var{"b"}, Var{"c"}
+	m, n := Var{"m"}, Var{"n"}
 
-	// lambda
-	l := func(v Var, e ...Expression) Bind {
-		if len(e) == 0 {
-			panic("trying to make lambda expression with no body")
-		}
-		if len(e) == 1 {
-			return Bind{v, e[0]}
-		}
-		arg := Apply{e[0], e[1]}
-		for i := 2; i < len(e); i++ {
-			arg = Apply{arg, e[i]}
-		}
+	Id := l(x, x)
+	True := l(x, l(y, x))
+	False := l(x, l(y, y))
+	And := l(p, l(q, p, q, p))
 
-		return Bind{v, arg}
-	}
-	// apply
-	a := func(e ...Expression) Apply {
-		if len(e) < 2 {
-			panic("trying to apply less than two args")
+	//mul  λm.λn.λf.m (n f)
+	Mul := l(m, l(n, l(f, m, a(n, f))))
+	Plus := l(p, l(q, l(f, l(x, p, f, a(q, f, x)))))
+
+	// church numbers
+	churchN := func(i int) Bind {
+		body := Apply{Var{"f"}, x}
+		if i < 0 {
+			panic("No")
 		}
-		arg := Apply{e[0], e[1]}
-		for i := 2; i < len(e); i++ {
-			arg = Apply{arg, e[i]}
+		for i > 1 {
+			body = Apply{Var{"f"}, body}
+			i--
 		}
-		return arg
+		return l(Var{"f"}, l(x, body))
 	}
 
-	Id := Bind{x, x}
-	True := Bind{x, Bind{y, x}}
-	False := Bind{p, Bind{q, q}}
-	And := Bind{p, Bind{q, Apply{p, Apply{q, p}}}}
+	table := []struct {
+		description string
+		input       Expression
+		output      Expression
+	}{
 
-	fmt.Printf("%v\n%v\n", String(True), String(And))
-
-	Compute(Apply{scope{True}, False})
-	//Compute(Apply{Apply{True, False}, True})
-	Compute(Apply{True, Apply{Var{"m"}, Var{"n"}}})
-	Compute(Apply{And, Apply{True, False}})
-	//Compute(Scope{Apply{And, Apply{True, False}}})
-
-	// bug it out
-	Compute(Apply{Apply{True, False}, True})
-	Compute(Apply{Apply{scope{True}, scope{False}},
-		scope{True}})
-
-	Compute(Apply{b, Apply{Id, x}})
-
-	fmt.Printf("\nName Collision")
-	// renaming issue
-	// \y.\x.y) x
-	Compute(Apply{l(y, l(x, y)), x})
-	Compute(Apply{l(p, l(q, p, q, p)),
-		Apply{True, False}})
-
-	Compute(a(l(p, l(q, p, q, p)), True, False))
+		{"and true false = false",
+			a(And, True, False),
+			False,
+		},
+		{
+			"2 + 2 = 4",
+			a(Plus, churchN(2), churchN(2)),
+			churchN(4),
+		},
+		{
+			"3*5 = 15",
+			a(Mul, churchN(3), churchN(5)),
+			churchN(15),
+		},
+		{
+			"(λp.λy.p y) (λx.λq.q x) q",
+			a(l(p, l(y, p, y)), l(x, l(q, q, x)), q),
+			l(q, q, s(q)),
+		},
+		{
+			"(λx.λf.λx.x) m (Check that double binds parse correctly)",
+			a(l(x, l(Var{"f"}, l(x, x))), Var{"m"}),
+			l(Var{"f"}, l(x, x)),
+		},
+		{
+			"(λf.λx.f (f x)) (λf.λx.f (f x)) (λx.x) (λx.x)",
+			a(churchN(2), churchN(2), Id, Id),
+			Id,
+		},
+		{
+			"(λa.λb.λc.a a b c) (λx.c) (λx.c) (would require several alpha steps)",
+			a(l(A, l(B, l(C, A, A, B, C))), l(x, C), l(x, C)),
+			l(C, a(s(C), l(x, s(C))), C),
+		},
+	}
+	pass := true
+	for _, tt := range table {
+		result := Compute(tt.input)
+		if !reflect.DeepEqual(result, tt.output) {
+			pass = false
+			fmt.Printf("Failure: %v\n want %v\n got %v\n", tt.description,
+				String(tt.output), String(result))
+		}
+	}
+	return pass
 }
